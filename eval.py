@@ -5,11 +5,12 @@ from langchain_groq import ChatGroq
 import os
 from dotenv import load_dotenv
 from langchain_community.tools import TavilySearchResults
-from typing import TypedDict
+from typing import Optional, TypedDict
 from langgraph.graph import END, START, StateGraph, MessagesState
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from typing import Union
+
 
 from fastapi import FastAPI
 load_dotenv()
@@ -25,12 +26,17 @@ class InputState(TypedDict):
     user_answer:str
     gen_context:str
     question_type:str
+    subject: Optional[str]
 class OutputState(TypedDict):
     feedback:str
     Total_Score:int
     Accuracy: int
     Relevance_to_the_Question:int
     percentage:float
+    Logical_Consistency: int
+    Scientific_Accuracy: int
+    Depth_and_Explanation: int
+    Factual_Correctness: int
 class OverallState(InputState,OutputState):
     pass
 
@@ -78,127 +84,229 @@ def tool_chain(state:InputState):
     print("toolchain",z)
     return {"gen_context":z}
 
+class subject(BaseModel):
+    subject:str
+class question_re(BaseModel):
+    reformatted_question:str
+    
+def question_reformat(state: InputState)->InputState:
+    prompt = f"""
+    You are an assistant that helps to reformat questions. Your task is to rephrase the given question in a clear, structured, and grammatically correct way.
+
+    ### Input:
+    - **Original Question**: "{state['user_question']}"
+
+    ### Task:
+    Please reformat the question to make it more clear, direct, and formal if necessary. Your output should be a reformatted version of the original question.
+
+    ### Output Format:
+    Provide the reformatted question in the following JSON format:
+    ```json
+    {{
+        "reformatted_question": "<Rephrased version of the input question>"
+    }}
+    ```
+
+    """
+    # Invoke the LLM with the prompt
+    response_question = llm.invoke(prompt)
+    try:
+        parsed_response = question_re.parse_raw(response_question.content)  # Parse the JSON response
+        print("Parsed subject:", parsed_response.reformatted_question)  # Print parsed subject
+        return {"user_question":parsed_response.reformatted_question}
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        return {"user_question":state["user_question"]}
+
+
+def subject_checker(state: InputState)->InputState:
+    prompt = f"""
+You are an intelligent assistant trained to classify questions into specific subject categories. Your task is to analyze the given question and determine the most appropriate subject type based on its content.
+
+### Input:
+- **Question**: "{state['user_question']}"
+
+### Subject Categories:
+1. **Logical Reasoning**: Questions that involve patterns, puzzles, reasoning, or problem-solving.
+   - Examples: "If all cats are animals, and some animals are wild, can all cats be wild?" or "What comes next in the sequence: 2, 4, 8, 16, ...?"
+
+2. **Science**: Questions that relate to scientific concepts, theories, or facts from subjects like Physics, Biology, Chemistry, etc.
+   - Examples: "Why does water boil at 100 degrees Celsius?" or "What is the role of mitochondria in a cell?"
+
+3. **General Knowledge**: Questions that involve facts, history, geography, or any general topic outside of logic and science.
+   - Examples: "Who is the President of the United States in 2024?" or "Where is the Eiffel Tower located?"
+
+### Task:
+Analyze the question and classify it into one of the three categories: Logical Reasoning, Science, or General Knowledge.
+
+### Output Format:
+Provide your classification in the following JSON format:
+```json
+{{
+    "subject":"Logical Reasoning / Science / General Knowledge"
+}}
+"""
+    response_subject = llm.invoke(prompt)
+    try:
+        parsed_response = subject.parse_raw(response_subject.content)  # Parse the JSON response
+        print("Parsed subject:", parsed_response.subject)  # Print parsed subject
+        return {"subject":parsed_response.subject}
+    except Exception as e:
+        print(f"Error parsing response: {e}")
+        state["subject"] = "Unknown"
+
 
 
 
 # %%
-class EvaluationOutput(BaseModel):
-    Accuracy: int
+
+
+# Base Evaluation Output
+class BaseEvaluationOutput(BaseModel):
     Total_Score: int
     feedback: str
-    Relevance_to_the_Question:int
-    percentage:float
-    
+    percentage: float
 
+# Logical Evaluation Output
+class LogicalEvaluationOutput(BaseEvaluationOutput):
+    Logical_Consistency: int
+
+# Science Evaluation Output
+class ScienceEvaluationOutput(BaseEvaluationOutput):
+    Scientific_Accuracy: int
+    Depth_and_Explanation: int
+
+# General Knowledge Evaluation Output
+class GeneralKnowledgeEvaluationOutput(BaseEvaluationOutput):
+    Factual_Correctness: int
+    Relevance_to_the_Question: int
 
 
 # %%
 def evaluate(state: InputState):
-    """Evaluate the question and answer using the generated context."""
-    prompt = f"""
-You are an expert evaluator for a Q&A system. Your task is to evaluate the user's answer to a given question based on the following input details:
+    """Evaluate the question and answer using the generated context with a focus on mathematical accuracy."""
 
-- **Reference Answer**: "{state['gen_context']}" (if available; otherwise, base your evaluation on the question and subject knowledge)
-- **User's Answer**: "{state['user_answer']}"
+    print("eval",state["subject"])
+    if state["subject"]=="Logical Reasoning":
+        prompt = f"""
+You are an expert evaluator specializing in logical reasoning questions. Your task is to evaluate the user's answer based on the following input details:
+
 - **Question**: "{state['user_question']}"
+- **User's Answer**: "{state['user_answer']}"
+- **Reference Answer**: "{state['gen_context']}" (if available; otherwise, base your evaluation on logical principles)
 - **Question Type**: "{state['question_type']}"
 
 ### Evaluation Criteria:
-1. **Relevance to the Question (10 points)**: How well the user's answer addresses the question.
-2. **Accuracy (10 points)**: Whether the information provided is factually correct compared to the reference answer or subject knowledge.
+1. **Logical Consistency (10 points)**: Is the user's reasoning consistent and free of logical fallacies?
+   - Assign full points if the reasoning is flawless.
+   - Deduct points for errors, omissions, or contradictions.
+2. check weather the user'answer is upto the point such that it cannot be solved completely. and also check if trying some shortcuts . if the answer doesn't match remove some marks
 
-### Instructions:
-- if the answer is not relevance directly give  0 marks as the answer is not relevance
+
+### Scoring Instructions:
 - Provide a score for each criterion out of 10.
 - Calculate the total score out of 20 by summing the individual scores.
 - Calculate the percentage as `(Total Score / 20) * 100` and round it to two decimal places.
-- Provide constructive feedback on how the user can improve their answer.
+
+### Feedback:
+Provide constructive feedback that highlights strengths and areas of improvement in the user's reasoning.
 
 ### Output Format:
 Provide your evaluation strictly in the following JSON format:
 ```json
 {{
-    "Relevance_to_the_Question": (integer between 0-10),
-    "Accuracy": (integer between 0-10),
+    "Logical_Consistency": (integer between 0-10),
     "Total_Score": (integer between 0-20),
     "percentage": (float rounded to two decimal places),
-    "feedback": "Constructive feedback about the answer."
+    "feedback": "Constructive feedback focusing on logical reasoning."
 }}
 """
-# def evaluate(state: InputState):
-#     """Evaluate the question and answer using the generated context."""
-#     prompt = f"""
-# You are an expert educator, renowned for your ability to evaluate answers across various subjects with precision, fairness, and depth. Your task is to assess the user's answer based on the provided question, reference answer (if available), and the specific requirements of the subject.
+        response_model = LogicalEvaluationOutput
 
-# ### Information for Evaluation:
-# - **Reference Answer**: "{state['gen_context']}" (if provided; otherwise, base your evaluation on the question and subject knowledge)
-# - **User's Answer**: "{state['user_answer']}"
-# - **Question**: "{state['user_question']}"
-# - **Question Type**: "{state['question_type']}"
+    elif state['subject'] in ['Science', 'Physics', 'Biology']:
+        prompt = f"""
+You are an expert evaluator specializing in scientific subjects. Your task is to evaluate the user's answer to a scientific question based on the following input details:
 
-# ### Evaluation Guidelines:
-# 1. **Understand the Question**:
-#    - Analyze the question carefully to determine its key requirements, such as concepts, steps, grammar, or factual accuracy.
-# 2. **Evaluate the User's Answer Based on Subject**:
-#    - **English**: Check for correct grammar, sentence structure, vocabulary usage, and whether the answer aligns with the question's intent.
-#    - **Mathematics**: Evaluate the answer step-by-step, ensuring calculations, formulas, and logic are accurate, and verify the final answer.
-#    - **General Knowledge**: Verify the correctness and relevance of the answer against factual information.
-#    - **Other Subjects**: Ensure the answer demonstrates understanding of the subject, relevance to the question, and correctness of concepts or facts.
+- **Question**: "{state['user_question']}"
+- **User's Answer**: "{state['user_answer']}"
+- **Reference Answer**: "{state['gen_context']}" (if available; otherwise, use scientific principles to evaluate)
+- **Question Type**: "{state['question_type']}"
 
-# 3. **Apply the Scoring Criteria**:
-#    - **Factual Accuracy**: Score between 1-10 based on correctness and precision of the answer.
-#    - **Completeness**: Score between 1-10 based on how well the answer addresses all parts of the question.
-#    - **Errors**: Deduct points (up to 10) for mistakes, irrelevant information, or gaps in logic, grammar, or steps.
-#    - **Bonus for Excellence**: (Optional) Add bonus points for exceptional depth, creativity, or clarity, while staying within the total score limit.
+### Evaluation Criteria:
+1. **Scientific Accuracy (10 points)**: Does the user's answer align with established scientific principles?
+   - Assign full points for scientifically accurate and well-explained answers.
+   - Deduct points for inaccuracies or omissions.
+2. **Depth and Explanation (10 points)**: Does the user's answer demonstrate a good understanding of the topic and provide sufficient detail?
+   - Assign full points for thorough and well-articulated answers.
+   - Deduct points for incomplete or poorly explained answers.
+3. check if the users answer is incomplete or not upto the final point where it has to be check the user is not trying anyshortcuts
+### Scoring Instructions:
+- Provide a score for each criterion out of 10.
+- Calculate the total score out of 20 by summing the individual scores.
+- Calculate the percentage as `(Total Score / 20) * 100` and round it to two decimal places.
 
-# 4. **Calculate Total Score and Percentage**:
-#    - The maximum total score is **40**.
-#    - Convert the total score into a percentage: `(total_score / 40) * 100`.
+### Feedback:
+Provide constructive feedback that highlights strengths and areas of improvement, such as missing scientific details or logical inconsistencies.
 
-# 5. **Special Case**:
-#    - If the answer does not address the question or is entirely irrelevant, assign a **total score** of 0 and a **percentage** of 0%.
+### Output Format:
+Provide your evaluation strictly in the following JSON format:
+```json
+{{
+    "Scientific_Accuracy": (integer between 0-10),
+    "Depth_and_Explanation": (integer between 0-10),
+    "Total_Score": (integer between 0-20),
+    "percentage": (float rounded to two decimal places),
+    "feedback": "Constructive feedback focusing on scientific accuracy and depth."
+}}
+"""
+        response_model = ScienceEvaluationOutput
 
-# ### Scoring Output:
-# Provide your evaluation in the following structured JSON format:
-# ```json
-# {{
-#     "factual_accuracy": (integer between 1-10),
-#     "completeness": (integer between 1-10),
-#     "errors": (integer between 1-10),
-#     "total_score": (integer between 0-40),
-#     "percentage": (float rounded to two decimal places),
-#     "justification": "A detailed explanation of the evaluation, tailored to the subject, highlighting strengths, weaknesses, and the reasoning behind the scores."
-# }}
+    else:
+        print(state["subject"])
+        prompt = f"""
+You are an expert evaluator specializing in general knowledge and miscellaneous subjects. Your task is to evaluate the user's answer based on the following input details:
+
+- **Question**: "{state['user_question']}"
+- **User's Answer**: "{state['user_answer']}"
+- **Reference Answer**: "{state['gen_context']}" (if available; otherwise, base your evaluation on standard knowledge)
+- **Question Type**: "{state['question_type']}"
+
+### Evaluation Criteria:
+1. **Factual Correctness (10 points)**: Is the user's answer factually accurate?
+   - Assign full points for correct and precise answers.
+   - Deduct points for inaccuracies or incorrect information.
+2. **Relevance to the Question (10 points)**: Does the user's answer address the question directly and concisely?
+   - Assign full points for relevant and well-focused answers.
+   - Deduct points for irrelevant or vague answers.
+3. check if the users answer is incomplete or not upto the final point where it has to be check the user is not trying anyshortcuts
+
+
+### Scoring Instructions:
+- Provide a score for each criterion out of 10.
+- Calculate the total score out of 20 by summing the individual scores.
+- Calculate the percentage as `(Total Score / 20) * 100` and round it to two decimal places.
+
+### Feedback:
+Provide constructive feedback that highlights areas of improvement, such as factual errors or lack of clarity.
+
+### Output Format:
+Provide your evaluation strictly in the following JSON format:
+```json
+{{
+    "Factual_Correctness": (integer between 0-10),
+    "Relevance_to_the_Question": (integer between 0-10),
+    "Total_Score": (integer between 0-20),
+    "percentage": (float rounded to two decimal places),
+    "feedback": "Constructive feedback focusing on factual correctness and relevance."
+}}
+"""
+        response_model = GeneralKnowledgeEvaluationOutput
 
     
-    # prompt = f"""
-    # Here is a reference answer: "{state["gen_context"]}"
-    # Here is the user’s answer: "{state["user_answer"]}"
-    # Here is the question: "{state["user_question"]}"
-    # You are a highly skilled evaluator and check if the user answer is correct as per the question give full marks otherwise. Evaluate the user's answer using the following criteria:
-    # - Factual Accuracy: Rate from 1-10.
-    # - Completeness: Rate from 1-10.
-    # Provide the following structured output:
-    # {{
-    #     "factual_accuracy": (integer between 1-10),
-    #     "completeness": (integer between 1-10),
-    #     "total_score": (integer between 0-30),
-    #     "justification": (string)
-    # }}
-    # Ensure your response strictly adheres to this JSON format.
-    # """
     response = llm.invoke(prompt)
     try:
-        parsed_response = EvaluationOutput.parse_raw(response.content)
-        return {
-            "Total_Score": parsed_response.Total_Score,
-            "feedback": parsed_response.feedback,
-            "Accuracy":parsed_response.Accuracy,
-            "Relevance_to_the_Question":parsed_response.Relevance_to_the_Question,
-            "percentage":parsed_response.percentage
-
-
-        }
+        parsed_response = response_model.parse_raw(response.content)
+        return parsed_response.dict()
     except Exception as e:
         print("Error parsing response:", e)
         return {
@@ -211,11 +319,14 @@ Provide your evaluation strictly in the following JSON format:
 builder=StateGraph(OverallState, input=InputState, output=OutputState)
 builder.add_node("tailvy_tool",tool_chain)
 builder.add_node("evalulate",evaluate)
-builder.add_edge(START,"tailvy_tool")
+builder.add_node("question_reformat",question_reformat)
+builder.add_node("subject_finder",subject_checker)
+builder.add_edge(START,"question_reformat")
+builder.add_edge("question_reformat","subject_finder")
+builder.add_edge("subject_finder","tailvy_tool")
 builder.add_edge("tailvy_tool","evalulate")
 builder.add_edge("evalulate",END)
 graph=builder.compile()
-
 
 # # %%
 # from IPython.display import Image, display
